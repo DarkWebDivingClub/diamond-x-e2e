@@ -1,0 +1,621 @@
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use nostr_sdk::prelude::*;
+use nwc::nostr::nips::nip04;
+use nwc::nostr::nips::nip47::{
+    NostrWalletConnectUri, PayInvoiceRequest, Request, Response,
+};
+use serde_json::{json, Value};
+
+use crate::bitcoind::BitcoindHarness;
+use crate::process::ManagedChild;
+use crate::util;
+
+/// NCC control request kind (must match dln-node's CONTROL_REQUEST_KIND).
+const CONTROL_REQUEST_KIND: u16 = 23198;
+/// NCC control response kind (must match dln-node's CONTROL_RESPONSE_KIND).
+const CONTROL_RESPONSE_KIND: u16 = 23199;
+
+// ── Config structs for config.toml serialization ─────────────────────────
+
+#[derive(serde::Serialize)]
+struct LdkConfig {
+    node: LdkNodeConfig,
+    nostr: LdkNostrConfig,
+    wallet: LdkWalletConfig,
+    bitcoind: LdkBitcoindConfig,
+    signer: LdkSignerConfig,
+}
+
+#[derive(serde::Serialize)]
+struct LdkNodeConfig {
+    network: String,
+    listening_port: u16,
+    data_dir: String,
+}
+
+#[derive(serde::Serialize)]
+struct LdkNostrConfig {
+    relay: String,
+    private_key: String,
+}
+
+#[derive(serde::Serialize)]
+struct LdkWalletConfig {
+    max_channel_size_sats: u64,
+    min_channel_size_sats: u64,
+    auto_accept_channels: bool,
+}
+
+#[derive(serde::Serialize)]
+struct LdkBitcoindConfig {
+    rpc_host: String,
+    rpc_port: u16,
+    rpc_user: String,
+    rpc_password: String,
+}
+
+#[derive(serde::Serialize)]
+struct LdkSignerConfig {
+    transport: String,
+    relay: String,
+    nsec: String,
+    signer_pubkey: String,
+}
+
+// ── Public API ───────────────────────────────────────────────────────────
+
+/// Blackbox dln-node node managed as a child process.
+///
+/// All test operations go through the Nostr interface — NCC for control
+/// commands (open/close/list channels) and NWC for wallet commands
+/// (pay_invoice, get_balance, get_info).
+pub struct ElnNode {
+    pub child: ManagedChild,
+    pub signer_child: Option<ManagedChild>,
+    pub ln_port: u16,
+    node_id: String,
+    ncc_client: Client,
+    ncc_secret: SecretKey,
+    nwc_client: Client,
+    nwc_uri: NostrWalletConnectUri,
+    service_pubkey: PublicKey,
+}
+
+impl ElnNode {
+    /// Start dln-node as a child process, publish Nostr grants,
+    /// wait for readiness, and fund the on-chain wallet.
+    pub async fn start(
+        bitcoind: &BitcoindHarness,
+        miner_address: &str,
+        relay_url: &str,
+        output_dir: &Path,
+    ) -> Result<Self> {
+        let ln_port = util::free_port();
+
+        // ── 1. Generate keys ────────────────────────────────────────────
+        let service_keys = Keys::generate();
+        let service_pubkey = service_keys.public_key();
+
+        let controller_keys = Keys::generate();
+        let controller_secret = controller_keys.secret_key().clone();
+        let controller_pubkey = controller_keys.public_key();
+
+        let nwc_keys = Keys::generate();
+        let nwc_secret = nwc_keys.secret_key().clone();
+        let nwc_pubkey = nwc_keys.public_key();
+
+        let owner_keys = Keys::generate();
+
+        // ── 2. Publish grants to relay BEFORE spawning ──────────────────
+        let grant_client = Client::builder().signer(owner_keys.clone()).build();
+        grant_client.add_relay(relay_url).await?;
+        grant_client.connect().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // NCC grant: control methods for the controller key
+        let ncc_grant = json!({
+            "control": {
+                "open_channel": { "access_rate": null },
+                "list_channels": { "access_rate": null },
+                "close_channel": { "access_rate": null },
+            }
+        });
+        let d_ncc = format!("{service_pubkey}:{controller_pubkey}");
+        let ncc_event = EventBuilder::new(Kind::Custom(30078), ncc_grant.to_string())
+            .tag(Tag::parse(["d", &d_ncc]).expect("d tag"))
+            .tag(Tag::public_key(service_pubkey));
+        grant_client.send_event_builder(ncc_event).await?;
+
+        // NWC grant: wallet methods for the NWC client key
+        let nwc_grant = json!({
+            "methods": {
+                "get_info": { "access_rate": null },
+                "pay_invoice": { "access_rate": null },
+                "get_balance": { "access_rate": null },
+                "make_new_address": { "access_rate": null },
+            }
+        });
+        let d_nwc = format!("{service_pubkey}:{nwc_pubkey}");
+        let nwc_event = EventBuilder::new(Kind::Custom(30078), nwc_grant.to_string())
+            .tag(Tag::parse(["d", &d_nwc]).expect("d tag"))
+            .tag(Tag::public_key(service_pubkey));
+        grant_client.send_event_builder(nwc_event).await?;
+
+        tracing::info!("published NCC + NWC grants to relay");
+
+        // ── 3. Spawn eln-signer for Alice ────────────────────────
+        let np_keys = Keys::generate();
+        let signer_keys = Keys::generate();
+        let np_pubkey_hex = np_keys.public_key().to_hex();
+        let np_nsec_hex = np_keys.secret_key().to_secret_hex();
+        let signer_pubkey_hex = signer_keys.public_key().to_hex();
+        let signer_nsec_hex = signer_keys.secret_key().to_secret_hex();
+
+        tracing::info!("alice nostr NP pubkey: {}", np_pubkey_hex);
+        tracing::info!("alice nostr signer pubkey: {}", signer_pubkey_hex);
+
+        let signer_binary = eln_signer_binary()?;
+        let signer_args: Vec<&str> = vec![
+            "--relay", relay_url,
+            "--proxy-pubkey", &np_pubkey_hex,
+            "--nsec", &signer_nsec_hex,
+            "--network", "regtest",
+            "--integration-test",
+            "--protocol-version", "6",
+            "--policy-filter", "policy-commitment-htlc-routing-balance:warn",
+            "--policy-filter", "policy-routing-balanced:warn",
+        ];
+        let signer_child = ManagedChild::spawn(
+            "alice-eln-signer",
+            &signer_binary,
+            &signer_args,
+            output_dir,
+        )?;
+
+        // Give signer time to connect to relay and subscribe
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // ── 4. Write config.toml ────────────────────────────────────────
+        let cwd = PathBuf::from(util::unique_tmp_dir("ldk-ctrl"));
+        std::fs::create_dir_all(&cwd)?;
+        let data_dir = cwd.join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let config = LdkConfig {
+            node: LdkNodeConfig {
+                network: "regtest".to_string(),
+                listening_port: ln_port,
+                data_dir: data_dir.to_string_lossy().to_string(),
+            },
+            nostr: LdkNostrConfig {
+                relay: relay_url.to_string(),
+                private_key: service_keys.secret_key().to_secret_hex(),
+            },
+            wallet: LdkWalletConfig {
+                max_channel_size_sats: 10_000_000,
+                min_channel_size_sats: 20_000,
+                auto_accept_channels: true,
+            },
+            bitcoind: LdkBitcoindConfig {
+                rpc_host: bitcoind.rpc_host().to_string(),
+                rpc_port: bitcoind.rpc_port(),
+                rpc_user: bitcoind.rpc_user().to_string(),
+                rpc_password: bitcoind.rpc_password().to_string(),
+            },
+            signer: LdkSignerConfig {
+                transport: "nostr".to_string(),
+                relay: relay_url.to_string(),
+                nsec: np_nsec_hex,
+                signer_pubkey: signer_pubkey_hex,
+            },
+        };
+
+        let config_toml = toml::to_string(&config).context("serialize config.toml")?;
+        std::fs::write(cwd.join("config.toml"), &config_toml)?;
+        tracing::info!("wrote config.toml to {}", cwd.display());
+
+        // ── 5. Spawn dln-node binary ──────────────────────────────
+        let binary = dln_node_binary()?;
+        let child = ManagedChild::spawn_with_cwd(
+            "dln-node",
+            &binary,
+            &[],
+            output_dir,
+            Some(&cwd),
+        )?;
+
+        // ── 6. Set up NWC client and poll get_info ──────────────────────
+        let relay = RelayUrl::parse(relay_url)?;
+        let nwc_uri = NostrWalletConnectUri::new(
+            service_pubkey,
+            vec![relay],
+            nwc_secret.clone(),
+            None,
+        );
+
+        let nwc_client = Client::builder().signer(nwc_keys).build();
+        nwc_client.add_relay(relay_url).await?;
+        nwc_client.connect().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        nwc_client
+            .subscribe(
+                Filter::new()
+                    .kind(Kind::WalletConnectResponse)
+                    .author(service_pubkey),
+            )
+            .await?;
+
+        tracing::info!("polling get_info to confirm dln-node is ready...");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let node_id = loop {
+            match Self::send_nwc_request_static(
+                &nwc_client,
+                &nwc_uri,
+                service_pubkey,
+                Request::get_info(),
+            )
+            .await
+            {
+                Ok(resp) => {
+                    if let Ok(info) = resp.to_get_info() {
+                        if let Some(pubkey) = info.pubkey {
+                            break pubkey;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("get_info poll: {e:#}");
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                anyhow::bail!("timeout waiting for dln-node get_info (60s)");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+        tracing::info!("dln-node ready, node_id={node_id}");
+
+        // ── 7. Fund on-chain wallet via NWC make_new_address ────────────
+        let addr_resp = Self::send_nwc_request_static(
+            &nwc_client,
+            &nwc_uri,
+            service_pubkey,
+            Request::make_new_address(),
+        )
+        .await
+        .context("NWC make_new_address failed")?;
+        let addr = addr_resp
+            .to_make_new_address()
+            .context("make_new_address response parse failed")?
+            .address;
+
+        bitcoind.send_to_address(&addr, 0.05).await;
+        bitcoind.mine_blocks(1, miner_address).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match Self::send_nwc_request_static(
+                &nwc_client,
+                &nwc_uri,
+                service_pubkey,
+                Request::get_balance(),
+            )
+            .await
+            {
+                Ok(resp) => {
+                    if let Ok(balance) = resp.to_get_balance() {
+                        if balance.balance >= 4_000_000_000 {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+            if tokio::time::Instant::now() > deadline {
+                anyhow::bail!("dln-node funding timeout");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // ── 8. Set up NCC client ────────────────────────────────────────
+        let ncc_client = Client::builder().signer(controller_keys).build();
+        ncc_client.add_relay(relay_url).await?;
+        ncc_client.connect().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        ncc_client
+            .subscribe(
+                Filter::new()
+                    .kind(Kind::Custom(CONTROL_RESPONSE_KIND))
+                    .author(service_pubkey),
+            )
+            .await?;
+
+        tracing::info!(
+            "dln-node started, node_id={node_id}, ln_port={ln_port}",
+        );
+
+        Ok(Self {
+            child,
+            signer_child: Some(signer_child),
+            ln_port,
+            node_id,
+            ncc_client,
+            ncc_secret: controller_secret,
+            nwc_client,
+            nwc_uri,
+            service_pubkey,
+        })
+    }
+
+    // ── Public API (all via Nostr) ─────────────────────────────────────
+
+    pub fn node_id(&self) -> String {
+        self.node_id.clone()
+    }
+
+    /// Open a channel via NCC. `push_amount` is in **sats** (the NCC handler
+    /// converts to msat internally).
+    pub async fn open_channel(
+        &self,
+        node_id: &str,
+        addr: &str,
+        amount: u64,
+        push_amount: Option<u64>,
+    ) -> Result<()> {
+        let mut params = json!({
+            "pubkey": node_id,
+            "host": addr,
+            "amount": amount,
+        });
+        if let Some(push) = push_amount {
+            params["push_amount"] = json!(push);
+        }
+        let response = self
+            .send_ncc_request(json!({
+                "method": "open_channel",
+                "params": params,
+            }))
+            .await
+            .context("NCC open_channel failed")?;
+        if !response["error"].is_null() {
+            anyhow::bail!("open_channel error: {}", response["error"]);
+        }
+        Ok(())
+    }
+
+    /// Pay a Lightning invoice via NWC.
+    pub async fn pay_invoice(&self, invoice: &str) -> Result<()> {
+        let response = self
+            .send_nwc_request(Request::pay_invoice(PayInvoiceRequest::new(invoice)))
+            .await
+            .context("NWC pay_invoice failed")?;
+        if let Some(err) = response.error {
+            anyhow::bail!("pay_invoice error: {} [{:?}]", err.message, err.code);
+        }
+        Ok(())
+    }
+
+    /// List channels via NCC. Returns the JSON array of channel objects.
+    pub async fn list_channels(&self) -> Result<Vec<Value>> {
+        let response = self
+            .send_ncc_request(json!({
+                "method": "list_channels",
+                "params": {},
+            }))
+            .await
+            .context("NCC list_channels failed")?;
+        if !response["error"].is_null() {
+            anyhow::bail!("list_channels error: {}", response["error"]);
+        }
+        let channels = response["result"]["channels"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        Ok(channels)
+    }
+
+    /// Check if there is any channel with the given node_id (any state).
+    pub async fn has_channel_with(&self, node_id: &str) -> bool {
+        match self.list_channels().await {
+            Ok(channels) => channels
+                .iter()
+                .any(|c| c["peer_pubkey"].as_str() == Some(node_id)),
+            Err(_) => false,
+        }
+    }
+
+    /// Check if there is an active (ready + usable) channel with the given node_id.
+    pub async fn has_ready_channel_with(&self, node_id: &str) -> bool {
+        match self.list_channels().await {
+            Ok(channels) => channels.iter().any(|c| {
+                c["peer_pubkey"].as_str() == Some(node_id)
+                    && c["state"].as_str() == Some("active")
+            }),
+            Err(_) => false,
+        }
+    }
+
+    /// Close a channel via NCC.
+    pub async fn close_channel(&self, channel_id: &str, force: bool) -> Result<()> {
+        let response = self
+            .send_ncc_request(json!({
+                "method": "close_channel",
+                "params": {
+                    "id": channel_id,
+                    "force": force,
+                },
+            }))
+            .await
+            .context("NCC close_channel failed")?;
+        if !response["error"].is_null() {
+            anyhow::bail!("close_channel error: {}", response["error"]);
+        }
+        Ok(())
+    }
+
+    /// Get on-chain + lightning balance in millisatoshis via NWC.
+    pub async fn get_balance_msat(&self) -> Result<u64> {
+        let response = self
+            .send_nwc_request(Request::get_balance())
+            .await
+            .context("NWC get_balance failed")?;
+        if let Some(err) = response.error {
+            anyhow::bail!("get_balance error: {} [{:?}]", err.message, err.code);
+        }
+        let balance_response = response
+            .to_get_balance()
+            .context("get_balance response parse failed")?;
+        Ok(balance_response.balance)
+    }
+
+    // ── Private helpers ────────────────────────────────────────────────
+
+    /// Send an NCC control request (NIP-04 encrypted, kind 23198) and read
+    /// the response (kind 23199).
+    async fn send_ncc_request(&self, payload: Value) -> Result<Value> {
+        let encrypted =
+            nip04::encrypt(&self.ncc_secret, &self.service_pubkey, payload.to_string())?;
+        let request_event = EventBuilder::new(Kind::Custom(CONTROL_REQUEST_KIND), encrypted)
+            .tag(Tag::public_key(self.service_pubkey));
+        self.ncc_client
+            .send_event_builder(request_event)
+            .await?;
+
+        let response_event =
+            Self::read_ncc_response(&self.ncc_client, self.service_pubkey).await?;
+        let decrypted =
+            nip04::decrypt(&self.ncc_secret, &self.service_pubkey, &response_event.content)?;
+        let response: Value = serde_json::from_str(&decrypted)?;
+        Ok(response)
+    }
+
+    /// Wait for a control response event (kind 23199) from the service.
+    async fn read_ncc_response(client: &Client, service_pubkey: PublicKey) -> Result<Event> {
+        let timeout = Duration::from_secs(10);
+        let event = tokio::time::timeout(timeout, async {
+            let mut notifications = client.notifications();
+            while let Some(notification) = notifications.next().await {
+                if let ClientNotification::Event { event, .. } = notification {
+                    let event = event.as_ref();
+                    if event.kind == Kind::Custom(CONTROL_RESPONSE_KIND)
+                        && event.pubkey == service_pubkey
+                    {
+                        return Some(event.clone());
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .context("timeout waiting for NCC response")?
+        .context("notification stream ended before NCC response")?;
+        Ok(event)
+    }
+
+    /// Send an NWC request and read the response.
+    async fn send_nwc_request(&self, request: Request) -> Result<Response> {
+        Self::send_nwc_request_static(
+            &self.nwc_client,
+            &self.nwc_uri,
+            self.service_pubkey,
+            request,
+        )
+        .await
+    }
+
+    /// Static version of send_nwc_request used during startup before `self` exists.
+    async fn send_nwc_request_static(
+        client: &Client,
+        uri: &NostrWalletConnectUri,
+        service_pubkey: PublicKey,
+        request: Request,
+    ) -> Result<Response> {
+        let request_event = request
+            .to_event(uri)
+            .context("failed to create NWC request event")?;
+        client.send_event(&request_event).await?;
+
+        let timeout = Duration::from_secs(10);
+        let uri_clone = uri.clone();
+        let response = tokio::time::timeout(timeout, async {
+            let mut notifications = client.notifications();
+            while let Some(notification) = notifications.next().await {
+                if let ClientNotification::Event { event, .. } = notification {
+                    let event = event.as_ref();
+                    if event.kind == Kind::WalletConnectResponse
+                        && event.pubkey == service_pubkey
+                    {
+                        let resp = Response::from_event(&uri_clone, event)
+                            .context("failed to decrypt NWC response")?;
+                        return Ok(resp);
+                    }
+                }
+            }
+            anyhow::bail!("notification stream ended before NWC response")
+        })
+        .await
+        .context("timeout waiting for NWC response")??;
+        Ok(response)
+    }
+}
+
+/// Determine the eln-signer binary path.
+fn eln_signer_binary() -> Result<String> {
+    if let Ok(path) = std::env::var("ELN_SIGNER_BINARY") {
+        tracing::info!("Using pre-built eln-signer binary: {path}");
+        return Ok(path);
+    }
+
+    let transport_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("system-test parent")
+        .join("eln-signer");
+
+    tracing::info!("Building eln-signer from {}", transport_dir.display());
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--bin", "eln-signer"])
+        .current_dir(&transport_dir)
+        .status()
+        .context("failed to run cargo build for eln-signer")?;
+
+    anyhow::ensure!(status.success(), "cargo build eln-signer failed with {status}");
+
+    let binary = transport_dir.join("target/debug/eln-signer");
+    anyhow::ensure!(binary.exists(), "eln-signer binary not found at {}", binary.display());
+    Ok(binary.to_string_lossy().to_string())
+}
+
+/// Determine the dln-node binary path: `ELN_NODE_BINARY` env var,
+/// or build from `/home/rene/git/dln-node` via `cargo build`.
+fn dln_node_binary() -> Result<String> {
+    if let Ok(path) = std::env::var("ELN_NODE_BINARY") {
+        tracing::info!("Using pre-built dln-node binary: {path}");
+        return Ok(path);
+    }
+
+    let dln_node_dir = PathBuf::from("/home/rene/git/dln-node");
+    tracing::info!(
+        "Building dln-node from {}",
+        dln_node_dir.display()
+    );
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--bin", "dln-node"])
+        .current_dir(&dln_node_dir)
+        .status()
+        .context("failed to run cargo build for dln-node")?;
+
+    anyhow::ensure!(
+        status.success(),
+        "cargo build dln-node failed with {status}"
+    );
+
+    let binary = dln_node_dir.join("target/debug/dln-node");
+    anyhow::ensure!(
+        binary.exists(),
+        "dln-node binary not found at {}",
+        binary.display()
+    );
+    Ok(binary.to_string_lossy().to_string())
+}
