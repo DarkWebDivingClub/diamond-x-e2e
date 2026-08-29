@@ -68,13 +68,15 @@ struct LdkSignerConfig {
     signer_pubkey: Option<String>,
 }
 
-/// How the node obtains its VLS signer.
+/// How the node signs.
 ///
-/// There is no signerless mode: `Embedded` runs an in-process VLS signer
-/// with a NullTransport, `Nostr` spawns a separate signer process that the
-/// node reaches over a relay.
+/// `Plain` bypasses VLS entirely: ldk-node uses its own KeysManager and BDK
+/// wallet, seeded from its storage dir. No policy validation. `Embedded` runs
+/// an in-process VLS signer with a NullTransport. `Nostr` spawns a separate
+/// signer process reached over a relay.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SignerMode {
+    Plain,
     Embedded,
     Nostr,
 }
@@ -165,6 +167,7 @@ impl DlnNode {
                 "get_info": { "access_rate": null },
                 "pay_invoice": { "access_rate": null },
                 "get_balance": { "access_rate": null },
+                "make_invoice": { "access_rate": null },
                 "make_new_address": { "access_rate": null },
             }
         });
@@ -212,7 +215,10 @@ impl DlnNode {
             tokio::time::sleep(Duration::from_secs(2)).await;
             Some(child)
         } else {
-            tracing::info!("{name} using embedded (in-process) VLS signer");
+            match signer_mode {
+                SignerMode::Plain => tracing::info!("{name} using plain LDK keys (no VLS)"),
+                _ => tracing::info!("{name} using embedded (in-process) VLS signer"),
+            }
             None
         };
 
@@ -252,6 +258,12 @@ impl DlnNode {
                 },
                 SignerMode::Embedded => LdkSignerConfig {
                     transport: "embedded".to_string(),
+                    relay: None,
+                    nsec: None,
+                    signer_pubkey: None,
+                },
+                SignerMode::Plain => LdkSignerConfig {
+                    transport: "none".to_string(),
                     relay: None,
                     nsec: None,
                     signer_pubkey: None,

@@ -1,10 +1,9 @@
-//! Two dln-node instances, each with an in-process (embedded) VLS signer,
-//! over a Bitcoin Core regtest network.
+//! Two plain dln-node instances over a Bitcoin Core regtest network.
 //!
-//! No remote signer and no `eln-signer` process is involved: both nodes take
-//! the `SignerMode::Embedded` path, which builds an EmbeddedSigner with a
-//! NullTransport. A Nostr relay is still required, because the harness drives
-//! the nodes over NWC/NCC — that is the control plane, not the signing path.
+//! No VLS at all: both nodes take the `SignerMode::Plain` path, so ldk-node
+//! uses its own KeysManager and BDK wallet, seeded from its storage dir. A
+//! Nostr relay is still required because the harness drives the nodes over
+//! NWC/NCC — that is the control plane, not the signing path.
 //!
 //! Scenario: alice opens a channel to bob, bob issues an invoice, alice pays
 //! it, and the balance change is asserted on both sides.
@@ -63,10 +62,10 @@ async fn run_scenario() -> Result<()> {
     let (_relay_container, relay_url) = relay::start_relay().await;
 
     // ── Step 3: Two nodes, both with embedded signers ───────────────────
-    info!("Step 3: Starting alice (embedded signer)");
+    info!("Step 3: Starting alice (plain, no VLS)");
     let alice = DlnNode::start_named(
         "alice",
-        SignerMode::Embedded,
+        SignerMode::Plain,
         &bitcoind,
         &miner_address,
         &relay_url,
@@ -76,10 +75,10 @@ async fn run_scenario() -> Result<()> {
     .context("failed to start alice")?;
     info!("  alice node_id={}", alice.node_id());
 
-    info!("Step 4: Starting bob (embedded signer)");
+    info!("Step 4: Starting bob (plain, no VLS)");
     let bob = DlnNode::start_named(
         "bob",
-        SignerMode::Embedded,
+        SignerMode::Plain,
         &bitcoind,
         &miner_address,
         &relay_url,
@@ -91,7 +90,14 @@ async fn run_scenario() -> Result<()> {
 
     anyhow::ensure!(
         alice.signer_child.is_none() && bob.signer_child.is_none(),
-        "expected no external signer process in embedded mode"
+        "expected no external signer process in plain mode"
+    );
+    // Fail fast and clearly if the two nodes report the same identity, rather
+    // than timing out later waiting for a channel that can never open.
+    anyhow::ensure!(
+        alice.node_id() != bob.node_id(),
+        "alice and bob report the same node_id ({}) — node addressing is wrong",
+        alice.node_id()
     );
 
     // ── Step 5: alice opens a channel to bob ────────────────────────────
