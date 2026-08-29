@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
-    NostrWalletConnectUri, PayInvoiceRequest, Request, Response,
+    MakeInvoiceRequest, NostrWalletConnectUri, PayInvoiceRequest, Request, Response,
 };
 use serde_json::{json, Value};
 
@@ -60,9 +60,23 @@ struct LdkBitcoindConfig {
 #[derive(serde::Serialize)]
 struct LdkSignerConfig {
     transport: String,
-    relay: String,
-    nsec: String,
-    signer_pubkey: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nsec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signer_pubkey: Option<String>,
+}
+
+/// How the node obtains its VLS signer.
+///
+/// There is no signerless mode: `Embedded` runs an in-process VLS signer
+/// with a NullTransport, `Nostr` spawns a separate signer process that the
+/// node reaches over a relay.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SignerMode {
+    Embedded,
+    Nostr,
 }
 
 // ── Public API ───────────────────────────────────────────────────────────
@@ -72,7 +86,7 @@ struct LdkSignerConfig {
 /// All test operations go through the Nostr interface — NCC for control
 /// commands (open/close/list channels) and NWC for wallet commands
 /// (pay_invoice, get_balance, get_info).
-pub struct ElnNode {
+pub struct DlnNode {
     pub child: ManagedChild,
     pub signer_child: Option<ManagedChild>,
     pub ln_port: u16,
@@ -84,10 +98,26 @@ pub struct ElnNode {
     service_pubkey: PublicKey,
 }
 
-impl ElnNode {
+impl DlnNode {
     /// Start dln-node as a child process, publish Nostr grants,
     /// wait for readiness, and fund the on-chain wallet.
+    /// Start with a remote signer over Nostr, labelled "alice".
     pub async fn start(
+        bitcoind: &BitcoindHarness,
+        miner_address: &str,
+        relay_url: &str,
+        output_dir: &Path,
+    ) -> Result<Self> {
+        Self::start_named("alice", SignerMode::Nostr, bitcoind, miner_address, relay_url, output_dir).await
+    }
+
+    /// Start a named node with the given signer mode.
+    ///
+    /// `name` labels the child processes and log files, so several nodes can
+    /// run side by side in one scenario.
+    pub async fn start_named(
+        name: &str,
+        signer_mode: SignerMode,
         bitcoind: &BitcoindHarness,
         miner_address: &str,
         relay_url: &str,
@@ -146,7 +176,9 @@ impl ElnNode {
 
         tracing::info!("published NCC + NWC grants to relay");
 
-        // ── 3. Spawn eln-signer for Alice ────────────────────────
+        // ── 3. Signer ───────────────────────────────────────────────────
+        // Embedded: the node runs an in-process VLS signer, nothing to spawn.
+        // Nostr: spawn a separate eln-signer that the node reaches by relay.
         let np_keys = Keys::generate();
         let signer_keys = Keys::generate();
         let np_pubkey_hex = np_keys.public_key().to_hex();
@@ -154,29 +186,35 @@ impl ElnNode {
         let signer_pubkey_hex = signer_keys.public_key().to_hex();
         let signer_nsec_hex = signer_keys.secret_key().to_secret_hex();
 
-        tracing::info!("alice nostr NP pubkey: {}", np_pubkey_hex);
-        tracing::info!("alice nostr signer pubkey: {}", signer_pubkey_hex);
+        let signer_child = if signer_mode == SignerMode::Nostr {
+            tracing::info!("{name} nostr NP pubkey: {}", np_pubkey_hex);
+            tracing::info!("{name} nostr signer pubkey: {}", signer_pubkey_hex);
 
-        let signer_binary = eln_signer_binary()?;
-        let signer_args: Vec<&str> = vec![
-            "--relay", relay_url,
-            "--proxy-pubkey", &np_pubkey_hex,
-            "--nsec", &signer_nsec_hex,
-            "--network", "regtest",
-            "--integration-test",
-            "--protocol-version", "6",
-            "--policy-filter", "policy-commitment-htlc-routing-balance:warn",
-            "--policy-filter", "policy-routing-balanced:warn",
-        ];
-        let signer_child = ManagedChild::spawn(
-            "alice-eln-signer",
-            &signer_binary,
-            &signer_args,
-            output_dir,
-        )?;
+            let signer_binary = eln_signer_binary()?;
+            let signer_args: Vec<&str> = vec![
+                "--relay", relay_url,
+                "--proxy-pubkey", &np_pubkey_hex,
+                "--nsec", &signer_nsec_hex,
+                "--network", "regtest",
+                "--integration-test",
+                "--protocol-version", "6",
+                "--policy-filter", "policy-commitment-htlc-routing-balance:warn",
+                "--policy-filter", "policy-routing-balanced:warn",
+            ];
+            let child = ManagedChild::spawn(
+                &format!("{name}-eln-signer"),
+                &signer_binary,
+                &signer_args,
+                output_dir,
+            )?;
 
-        // Give signer time to connect to relay and subscribe
-        tokio::time::sleep(Duration::from_secs(2)).await;
+            // Give signer time to connect to relay and subscribe
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Some(child)
+        } else {
+            tracing::info!("{name} using embedded (in-process) VLS signer");
+            None
+        };
 
         // ── 4. Write config.toml ────────────────────────────────────────
         let cwd = PathBuf::from(util::unique_tmp_dir("ldk-ctrl"));
@@ -205,11 +243,19 @@ impl ElnNode {
                 rpc_user: bitcoind.rpc_user().to_string(),
                 rpc_password: bitcoind.rpc_password().to_string(),
             },
-            signer: LdkSignerConfig {
-                transport: "nostr".to_string(),
-                relay: relay_url.to_string(),
-                nsec: np_nsec_hex,
-                signer_pubkey: signer_pubkey_hex,
+            signer: match signer_mode {
+                SignerMode::Nostr => LdkSignerConfig {
+                    transport: "nostr".to_string(),
+                    relay: Some(relay_url.to_string()),
+                    nsec: Some(np_nsec_hex),
+                    signer_pubkey: Some(signer_pubkey_hex),
+                },
+                SignerMode::Embedded => LdkSignerConfig {
+                    transport: "embedded".to_string(),
+                    relay: None,
+                    nsec: None,
+                    signer_pubkey: None,
+                },
             },
         };
 
@@ -220,7 +266,7 @@ impl ElnNode {
         // ── 5. Spawn dln-node binary ──────────────────────────────
         let binary = dln_node_binary()?;
         let child = ManagedChild::spawn_with_cwd(
-            "dln-node",
+            &format!("{name}-dln-node"),
             &binary,
             &[],
             output_dir,
@@ -338,7 +384,7 @@ impl ElnNode {
 
         Ok(Self {
             child,
-            signer_child: Some(signer_child),
+            signer_child,
             ln_port,
             node_id,
             ncc_client,
@@ -395,6 +441,26 @@ impl ElnNode {
             anyhow::bail!("pay_invoice error: {} [{:?}]", err.message, err.code);
         }
         Ok(())
+    }
+
+    /// Create a BOLT11 invoice via NWC.
+    pub async fn make_invoice(&self, amount_msat: u64, description: &str) -> Result<String> {
+        let response = self
+            .send_nwc_request(Request::make_invoice(MakeInvoiceRequest {
+                amount: amount_msat,
+                description: Some(description.to_string()),
+                description_hash: None,
+                expiry: None,
+            }))
+            .await
+            .context("NWC make_invoice failed")?;
+        if let Some(err) = response.error {
+            anyhow::bail!("make_invoice error: {} [{:?}]", err.message, err.code);
+        }
+        let made = response
+            .to_make_invoice()
+            .context("make_invoice response parse failed")?;
+        Ok(made.invoice)
     }
 
     /// List channels via NCC. Returns the JSON array of channel objects.

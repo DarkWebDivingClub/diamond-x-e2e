@@ -1,9 +1,4 @@
-mod bitcoind;
-mod dln_node_client;
-mod lnrod_client;
-mod process;
-mod relay;
-mod util;
+use dln_e2e_test::{bitcoind, dln_node_client, lnrod_client, relay, util};
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,10 +6,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tracing::info;
 
-use crate::bitcoind::BitcoindHarness;
-use crate::dln_node_client::ElnNode;
-use crate::lnrod_client::LnrodNode;
-use crate::lnrod_client::admin_api::payment::PaymentStatus;
+use dln_e2e_test::bitcoind::BitcoindHarness;
+use dln_e2e_test::dln_node_client::DlnNode;
+use dln_e2e_test::lnrod_client::LnrodNode;
+use dln_e2e_test::lnrod_client::admin_api::payment::PaymentStatus;
 
 #[tokio::main]
 async fn main() {
@@ -61,7 +56,7 @@ async fn run_scenario() -> Result<()> {
     // ── Step 2: Start dln-node (child process) ─────────────────
     info!("Step 2: Starting dln-node");
 
-    let mut ldk_node = ElnNode::start(&bitcoind, &miner_address, &relay_url, &output_dir)
+    let mut ldk_node = DlnNode::start(&bitcoind, &miner_address, &relay_url, &output_dir)
         .await
         .context("failed to start dln-node")?;
     info!("  dln-node node_id={}", ldk_node.node_id());
