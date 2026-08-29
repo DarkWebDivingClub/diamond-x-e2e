@@ -701,10 +701,10 @@ fn eln_signer_binary() -> Result<String> {
     Ok(binary.to_string_lossy().to_string())
 }
 
-/// Determine the dln-node binary path: `ELN_NODE_BINARY` env var,
+/// Determine the dln-node binary path: `DLN_NODE_BINARY` env var,
 /// or build from `/home/rene/git/dln-node` via `cargo build`.
 fn dln_node_binary() -> Result<String> {
-    if let Ok(path) = std::env::var("ELN_NODE_BINARY") {
+    if let Ok(path) = std::env::var("DLN_NODE_BINARY") {
         tracing::info!("Using pre-built dln-node binary: {path}");
         return Ok(path);
     }

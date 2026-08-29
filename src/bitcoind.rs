@@ -18,24 +18,56 @@ pub struct BitcoindHarness {
     client: reqwest::Client,
 }
 
+/// Bitcoin Core regtest image.
+const CORE_IMAGE: (&str, &str) = ("ruimarinho/bitcoin-core", "latest");
+
+/// Bitcoin Knots regtest image, built by `docker/knots/build.sh`.
+const KNOTS_IMAGE: (&str, &str) = ("dwdc/bitcoin-knots", "29");
+
 impl BitcoindHarness {
+    /// Start a Bitcoin Core regtest node.
     pub async fn start() -> Self {
-        let container = GenericImage::new("ruimarinho/bitcoin-core", "latest")
+        Self::start_with(CORE_IMAGE.0, CORE_IMAGE.1, &[]).await
+    }
+
+    /// Start a Bitcoin Knots regtest node at level 0 — no
+    /// `-testactivationheight`, so `Blake2bHeight` stays at `INT_MAX` and
+    /// the chain produces only v1 headers (80 bytes, SHA256d).
+    ///
+    /// `-blake2b_headline` is mandatory: the node refuses to start without
+    /// it. Its value is consensus-critical on a real chain but arbitrary on
+    /// a regtest chain that never activates.
+    pub async fn start_knots() -> Self {
+        Self::start_with(
+            KNOTS_IMAGE.0,
+            KNOTS_IMAGE.1,
+            &["-blake2b_headline=dwdc regtest level 0"],
+        )
+        .await
+    }
+
+    /// Start a regtest node from an arbitrary image, with extra daemon args
+    /// appended to the standard set.
+    pub async fn start_with(image: &str, tag: &str, extra_args: &[&str]) -> Self {
+        let mut cmd = vec![
+            "-regtest=1".to_string(),
+            "-server=1".to_string(),
+            "-txindex=1".to_string(),
+            "-printtoconsole".to_string(),
+            "-fallbackfee=0.0002".to_string(),
+            "-rpcbind=0.0.0.0".to_string(),
+            "-rpcallowip=0.0.0.0/0".to_string(),
+            format!("-rpcuser={RPC_USER}"),
+            format!("-rpcpassword={RPC_PASS}"),
+        ];
+        cmd.extend(extra_args.iter().map(|a| a.to_string()));
+
+        let container = GenericImage::new(image, tag)
             .with_exposed_port(RPC_PORT.tcp())
-            .with_cmd(vec![
-                "-regtest=1".to_string(),
-                "-server=1".to_string(),
-                "-txindex=1".to_string(),
-                "-printtoconsole".to_string(),
-                "-fallbackfee=0.0002".to_string(),
-                "-rpcbind=0.0.0.0".to_string(),
-                "-rpcallowip=0.0.0.0/0".to_string(),
-                format!("-rpcuser={RPC_USER}"),
-                format!("-rpcpassword={RPC_PASS}"),
-            ])
+            .with_cmd(cmd)
             .start()
             .await
-            .expect("Failed to start bitcoind container");
+            .unwrap_or_else(|e| panic!("Failed to start {image}:{tag} container: {e}"));
 
         let host_port = container
             .get_host_port_ipv4(RPC_PORT)
