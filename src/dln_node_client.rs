@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
-    MakeInvoiceRequest, NostrWalletConnectUri, PayInvoiceRequest, Request, Response,
+    MakeInvoiceRequest, NostrWalletConnectUri, PayInvoiceRequest, PayOnchainRequest, Request,
+    Response,
 };
 use serde_json::{json, Value};
 
@@ -168,6 +169,7 @@ impl DlnNode {
                 "pay_invoice": { "access_rate": null },
                 "get_balance": { "access_rate": null },
                 "make_invoice": { "access_rate": null },
+                "pay_onchain": { "access_rate": null },
                 "make_new_address": { "access_rate": null },
             }
         });
@@ -473,6 +475,40 @@ impl DlnNode {
             .to_make_invoice()
             .context("make_invoice response parse failed")?;
         Ok(made.invoice)
+    }
+
+    /// Get a fresh on-chain address from the node's BDK wallet.
+    pub async fn new_onchain_address(&self) -> Result<String> {
+        let response = self
+            .send_nwc_request(Request::make_new_address())
+            .await
+            .context("NWC make_new_address failed")?;
+        if let Some(err) = response.error {
+            anyhow::bail!("make_new_address error: {} [{:?}]", err.message, err.code);
+        }
+        let made = response
+            .to_make_new_address()
+            .context("make_new_address response parse failed")?;
+        Ok(made.address)
+    }
+
+    /// Send an on-chain payment. Returns the txid.
+    pub async fn pay_onchain(&self, address: &str, amount_sats: u64) -> Result<String> {
+        let response = self
+            .send_nwc_request(Request::pay_onchain(PayOnchainRequest {
+                address: address.to_string(),
+                amount: amount_sats,
+                feerate: None,
+            }))
+            .await
+            .context("NWC pay_onchain failed")?;
+        if let Some(err) = response.error {
+            anyhow::bail!("pay_onchain error: {} [{:?}]", err.message, err.code);
+        }
+        let paid = response
+            .to_pay_onchain()
+            .context("pay_onchain response parse failed")?;
+        Ok(paid.txid)
     }
 
     /// List channels via NCC. Returns the JSON array of channel objects.

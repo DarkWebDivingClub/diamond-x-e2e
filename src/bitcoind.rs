@@ -129,6 +129,12 @@ impl BitcoindHarness {
         panic!("bitcoind RPC did not become ready in time");
     }
 
+    /// Issue an arbitrary JSON-RPC call, for assertions the typed helpers
+    /// above do not cover.
+    pub async fn rpc(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.rpc_call(method, params).await
+    }
+
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value, String> {
         let body = json!({
             "jsonrpc": "1.0",
