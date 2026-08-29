@@ -53,7 +53,7 @@ async fn run_scenario() -> Result<()> {
 
     // ── Step 1: Bitcoin Core regtest ────────────────────────────────────
     info!("Step 1: Starting bitcoind (regtest) and mining to maturity");
-    let bitcoind = BitcoindHarness::start().await;
+    let bitcoind = BitcoindHarness::start_from_env().await;
     let miner_address = bitcoind.get_new_address().await;
     bitcoind.mine_blocks(110, &miner_address).await;
 

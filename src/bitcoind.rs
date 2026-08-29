@@ -46,6 +46,22 @@ impl BitcoindHarness {
         .await
     }
 
+    /// Start whichever backend `BITCOIND_IMPL` selects — `core` (default)
+    /// or `knots`.
+    ///
+    /// Lets one scenario run against either chain without duplicating it.
+    /// Pair with `DLN_NODE_BINARY` to use the matching node build.
+    pub async fn start_from_env() -> Self {
+        match std::env::var("BITCOIND_IMPL").unwrap_or_else(|_| "core".to_string()).as_str() {
+            "knots" => {
+                tracing::info!("BITCOIND_IMPL=knots — using the Bitcoin Knots backend");
+                Self::start_knots().await
+            }
+            "core" => Self::start().await,
+            other => panic!("unknown BITCOIND_IMPL {other:?}, expected core or knots"),
+        }
+    }
+
     /// Start a regtest node from an arbitrary image, with extra daemon args
     /// appended to the standard set.
     pub async fn start_with(image: &str, tag: &str, extra_args: &[&str]) -> Self {

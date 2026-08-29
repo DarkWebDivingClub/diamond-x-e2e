@@ -115,13 +115,33 @@ impl DlnNode {
         Self::start_named("alice", SignerMode::Nostr, bitcoind, miner_address, relay_url, output_dir).await
     }
 
-    /// Start a named node with the given signer mode.
+    /// Start a named node with the given signer mode, using the default
+    /// node binary.
     ///
     /// `name` labels the child processes and log files, so several nodes can
     /// run side by side in one scenario.
     pub async fn start_named(
         name: &str,
         signer_mode: SignerMode,
+        bitcoind: &BitcoindHarness,
+        miner_address: &str,
+        relay_url: &str,
+        output_dir: &Path,
+    ) -> Result<Self> {
+        Self::start_on(name, signer_mode, None, bitcoind, miner_address, relay_url, output_dir)
+            .await
+    }
+
+    /// Start a named node from a specific binary.
+    ///
+    /// A scenario spanning two chains needs a different binary per chain —
+    /// `dln-node` on one side and `dln-node-knots` on the other — so the
+    /// path cannot be a process-wide default.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_on(
+        name: &str,
+        signer_mode: SignerMode,
+        node_binary: Option<&str>,
         bitcoind: &BitcoindHarness,
         miner_address: &str,
         relay_url: &str,
@@ -283,7 +303,10 @@ impl DlnNode {
         tracing::info!("wrote config.toml to {}", cwd.display());
 
         // ── 5. Spawn dln-node binary ──────────────────────────────
-        let binary = dln_node_binary()?;
+        let binary = match node_binary {
+            Some(path) => path.to_string(),
+            None => dln_node_binary()?,
+        };
         let child = ManagedChild::spawn_with_cwd(
             &format!("{name}-dln-node"),
             &binary,
