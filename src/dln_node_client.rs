@@ -344,6 +344,7 @@ impl DlnNode {
                 &nwc_uri,
                 service_pubkey,
                 Request::get_info(),
+                None,
             )
             .await
             {
@@ -371,6 +372,7 @@ impl DlnNode {
             &nwc_uri,
             service_pubkey,
             Request::make_new_address(),
+            None,
         )
         .await
         .context("NWC make_new_address failed")?;
@@ -389,6 +391,7 @@ impl DlnNode {
                 &nwc_uri,
                 service_pubkey,
                 Request::get_balance(),
+                None,
             )
             .await
             {
@@ -481,7 +484,10 @@ impl DlnNode {
     /// did not choose — the mechanism a cross-chain swap depends on.
     pub async fn pay_invoice(&self, invoice: &str) -> Result<String> {
         let response = self
-            .send_nwc_request(Request::pay_invoice(PayInvoiceRequest::new(invoice)))
+            .send_nwc_request_timeout(
+                Request::pay_invoice(PayInvoiceRequest::new(invoice)),
+                Some(Duration::from_secs(300)),
+            )
             .await
             .context("NWC pay_invoice failed")?;
         if let Some(err) = response.error {
@@ -754,28 +760,41 @@ impl DlnNode {
 
     /// Send an NWC request and read the response.
     async fn send_nwc_request(&self, request: Request) -> Result<Response> {
+        self.send_nwc_request_timeout(request, None).await
+    }
+
+    async fn send_nwc_request_timeout(
+        &self,
+        request: Request,
+        timeout: Option<Duration>,
+    ) -> Result<Response> {
         Self::send_nwc_request_static(
             &self.nwc_client,
             &self.nwc_uri,
             self.service_pubkey,
             request,
+            timeout,
         )
         .await
     }
 
     /// Static version of send_nwc_request used during startup before `self` exists.
+    /// `timeout` overrides the default 10s wait. Paying a hold invoice is
+    /// long-running by design — the response cannot arrive until the payee
+    /// settles — so it needs a longer one. Everything else should fail fast.
     async fn send_nwc_request_static(
         client: &Client,
         uri: &NostrWalletConnectUri,
         service_pubkey: PublicKey,
         request: Request,
+        timeout: Option<Duration>,
     ) -> Result<Response> {
         let request_event = request
             .to_event(uri)
             .context("failed to create NWC request event")?;
         client.send_event(&request_event).await?;
 
-        let timeout = Duration::from_secs(10);
+        let timeout = timeout.unwrap_or(Duration::from_secs(10));
         let uri_clone = uri.clone();
         let response = tokio::time::timeout(timeout, async {
             let mut notifications = client.notifications();
