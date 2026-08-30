@@ -24,7 +24,6 @@ use dln_e2e_test::bitcoind::BitcoindHarness;
 use dln_e2e_test::dln_node_client::{DlnNode, SignerMode};
 use dln_e2e_test::{relay, util};
 
-const KNOTS_NODE_DIR: &str = "/home/rene/git/dln-node-knots";
 
 #[tokio::main]
 async fn main() {
@@ -57,7 +56,7 @@ async fn run_scenario() -> Result<()> {
 
     // ── Step 1: use the Knots build of the node ─────────────────────────
     if std::env::var("DLN_NODE_BINARY").is_err() {
-        let binary = build_knots_node()?;
+        let binary = util::build_knots_node()?;
         info!("Step 1: using dln-node-knots at {binary}");
         std::env::set_var("DLN_NODE_BINARY", &binary);
     }
@@ -136,19 +135,3 @@ async fn run_scenario() -> Result<()> {
     Ok(())
 }
 
-/// Build `dln-node-knots` and return the binary path.
-fn build_knots_node() -> Result<String> {
-    let dir = PathBuf::from(KNOTS_NODE_DIR);
-    anyhow::ensure!(dir.is_dir(), "{KNOTS_NODE_DIR} not found");
-
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--bin", "dln-node"])
-        .current_dir(&dir)
-        .status()
-        .context("failed to run cargo build for dln-node-knots")?;
-    anyhow::ensure!(status.success(), "cargo build failed with {status}");
-
-    let binary = dir.join("target/debug/dln-node");
-    anyhow::ensure!(binary.exists(), "binary not found at {}", binary.display());
-    Ok(binary.to_string_lossy().to_string())
-}

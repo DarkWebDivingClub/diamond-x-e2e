@@ -25,7 +25,6 @@ use dln_e2e_test::bitcoind::BitcoindHarness;
 use dln_e2e_test::dln_node_client::{DlnNode, SignerMode};
 use dln_e2e_test::{relay, util};
 
-const KNOTS_NODE_DIR: &str = "/home/rene/git/dln-node-knots";
 const CHANNEL_SATS: u64 = 2_000_000;
 const PUSH_MSAT: u64 = 500_000;
 
@@ -58,7 +57,7 @@ async fn run_scenario() -> Result<()> {
     std::fs::create_dir_all(&output_dir)?;
     info!("Output directory: {}", output_dir.display());
 
-    let knots_binary = build_knots_node()?;
+    let knots_binary = util::build_knots_node()?;
 
     // ── Step 1: two chains ──────────────────────────────────────────────
     info!("Step 1: Starting both chains");
@@ -190,20 +189,6 @@ async fn height(h: &BitcoindHarness) -> Result<u64> {
     info["blocks"].as_u64().context("blocks missing")
 }
 
-/// Build `dln-node-knots` and return the binary path.
-fn build_knots_node() -> Result<String> {
-    let dir = PathBuf::from(KNOTS_NODE_DIR);
-    anyhow::ensure!(dir.is_dir(), "{KNOTS_NODE_DIR} not found");
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--bin", "dln-node"])
-        .current_dir(&dir)
-        .status()
-        .context("cargo build for dln-node-knots failed to run")?;
-    anyhow::ensure!(status.success(), "cargo build failed with {status}");
-    let binary = dir.join("target/debug/dln-node");
-    anyhow::ensure!(binary.exists(), "binary not found at {}", binary.display());
-    Ok(binary.to_string_lossy().to_string())
-}
 
 async fn wait_for<F, Fut>(timeout: Duration, what: &str, mut check: F) -> Result<()>
 where

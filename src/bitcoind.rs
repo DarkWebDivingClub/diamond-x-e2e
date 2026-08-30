@@ -24,6 +24,10 @@ const CORE_IMAGE: (&str, &str) = ("ruimarinho/bitcoin-core", "latest");
 /// Bitcoin Knots regtest image, built by `docker/knots/build.sh`.
 const KNOTS_IMAGE: (&str, &str) = ("dwdc/bitcoin-knots", "29");
 
+/// Coinbase headline for an activating regtest chain. Arbitrary, but every
+/// party has to agree on it — it is consensus-critical on a real chain.
+const ACTIVATION_HEADLINE: &str = "dwdc regtest blake2b activation";
+
 impl BitcoindHarness {
     /// Start a Bitcoin Core regtest node.
     pub async fn start() -> Self {
@@ -42,6 +46,26 @@ impl BitcoindHarness {
             KNOTS_IMAGE.0,
             KNOTS_IMAGE.1,
             &["-blake2b_headline=dwdc regtest level 0"],
+        )
+        .await
+    }
+
+    /// Start a Bitcoin Knots regtest node that activates BLAKE2b at
+    /// `height`, so blocks below it carry v1 headers and blocks at and
+    /// above it carry v2 headers.
+    ///
+    /// The headline is not decoration here. Consensus requires the coinbase
+    /// of the activation block to contain it, so a node started with a
+    /// different one rejects the chain this one builds. The internal miner
+    /// puts it there, which is why `generatetoaddress` is enough.
+    pub async fn start_knots_activating_at(height: u64) -> Self {
+        Self::start_with(
+            KNOTS_IMAGE.0,
+            KNOTS_IMAGE.1,
+            &[
+                &format!("-testactivationheight=blake2b@{height}"),
+                &format!("-blake2b_headline={ACTIVATION_HEADLINE}"),
+            ],
         )
         .await
     }

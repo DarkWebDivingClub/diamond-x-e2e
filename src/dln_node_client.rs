@@ -714,6 +714,26 @@ impl DlnNode {
         Ok(balance_response.balance)
     }
 
+    /// The node's view of the chain tip, over NWC `get_info`.
+    ///
+    /// This is `ldk-node`'s `current_best_block`, which it reaches through
+    /// `lightning-block-sync`. If header parsing broke, this is where it
+    /// would show: the height stops advancing while bitcoind's keeps going.
+    pub async fn block_height(&self) -> Result<u32> {
+        let response = self
+            .send_nwc_request(Request::get_info())
+            .await
+            .context("NWC get_info failed")?;
+        if let Some(err) = response.error {
+            anyhow::bail!("get_info error: {} [{:?}]", err.message, err.code);
+        }
+        response
+            .to_get_info()
+            .context("get_info response parse failed")?
+            .block_height
+            .context("get_info returned no block_height")
+    }
+
     // ── Private helpers ────────────────────────────────────────────────
 
     /// Send an NCC control request (NIP-04 encrypted, kind 23198) and read
