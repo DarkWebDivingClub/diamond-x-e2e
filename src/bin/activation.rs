@@ -14,7 +14,10 @@
 //!   * a channel opened before the switch is still there afterwards, with
 //!     its confirmation count continuous rather than restarted;
 //!   * a payment settles on the far side;
-//!   * a node restarted against an already-activated chain comes back.
+//!   * a node restarted against an already-activated chain comes back;
+//!   * and a channel opened, funded and paid over entirely under v2
+//!     headers works — the ordinary case once the fork is behind us,
+//!     as distinct from a channel that had to survive the switch.
 //!
 //! Requires `dln-node-knots` built with the `blake2b` feature; without it
 //! the node cannot parse a v2 header and step 6 is where it stops.
@@ -251,6 +254,50 @@ async fn run_scenario() -> Result<()> {
     })
     .await?;
     info!("  carol synced to {tip} from cold");
+
+    // ── Step 11: a channel that never saw a v1 header ───────────────────
+    // The channel above was funded before the switch and had to survive it.
+    // This is the other case, and the ordinary one after the fork: a
+    // channel opened, funded and confirmed entirely under v2 headers.
+    info!("Step 11: carol opens a channel to bob under v2 headers only");
+    carol
+        .open_channel(&bob_id, &format!("127.0.0.1:{}", bob.ln_port), CHANNEL_SATS, Some(PUSH_MSAT))
+        .await
+        .context("carol could not open a channel on an activated chain")?;
+    wait_for(Duration::from_secs(180), "carol's channel to become ready", || {
+        let (carol, bob, bob_id, bitcoind, miner) = (&carol, &bob, &bob_id, &bitcoind, &miner);
+        async move {
+            bitcoind.mine_blocks(1, miner).await;
+            Ok(carol.has_ready_channel_with(bob_id).await
+                && bob.has_ready_channel_with(&carol.node_id()).await)
+        }
+    })
+    .await?;
+
+    // The funding transaction must be in a v2 block, or this is step 4
+    // again with extra steps.
+    let carol_funding = funding_height(&carol, &bob_id).await?;
+    anyhow::ensure!(
+        carol_funding >= ACTIVATION_HEIGHT,
+        "carol's funding is in block {carol_funding}, below activation at {ACTIVATION_HEIGHT} \
+         — this channel did not open under v2 headers"
+    );
+    assert_header(&bitcoind, carol_funding, 2).await?;
+    info!("  carol's funding confirmed in block {carol_funding}, a v2 block");
+
+    info!("Step 12: bob invoices, carol pays, both under v2 headers");
+    let bob_before = bob.get_balance_msat().await?;
+    let invoice = bob
+        .make_invoice(PAYMENT_MSAT, "activation e2e, v2-only channel")
+        .await
+        .context("bob make_invoice failed")?;
+    carol.pay_invoice(&invoice).await.context("carol pay_invoice failed")?;
+    wait_for(Duration::from_secs(60), "bob's balance to increase again", || {
+        let bob = &bob;
+        async move { Ok(bob.get_balance_msat().await? > bob_before) }
+    })
+    .await?;
+    info!("  paid over a channel that never saw a v1 header");
 
     Ok(())
 }
