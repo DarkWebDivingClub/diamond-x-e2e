@@ -1,0 +1,21 @@
+[package]
+name = "dln-e2e-harness"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Shared infrastructure for driving dln-node end-to-end scenarios."
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "time", "io-util"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+tracing = "0.1"
+
+nostr-sdk = { git = "https://github.com/dukeh3/nostr.git", rev = "9ac9adc2" }
+nwc = { git = "https://github.com/dukeh3/nostr.git", rev = "9ac9adc2" }
+toml = "0.8"
+
+testcontainers = "0.27"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

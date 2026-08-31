@@ -1,0 +1,19 @@
+[package]
+name = "diamond-x-e2e"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "End-to-end scenarios for the diamond-x exchange."
+
+[dependencies]
+dln-e2e-harness = { path = "../harness" }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "time", "io-util"] }
+anyhow = "1"
+serde_json = "1"
+hex = "0.4"
+sha2 = "0.10"
+lightning-invoice = "0.33"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nostr-sdk = { git = "https://github.com/dukeh3/nostr.git", rev = "9ac9adc2" }

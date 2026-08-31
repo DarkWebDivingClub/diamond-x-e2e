@@ -181,7 +181,7 @@ impl BitcoindHarness {
         RPC_PASS
     }
 
-    /// Full RPC URL including http:// scheme, suitable for passing to lnrod --bitcoin.
+    /// Full RPC URL including the http:// scheme.
     pub fn rpc_url_with_auth(&self) -> String {
         format!(
             "http://{}:{}@127.0.0.1:{}/wallet/testwallet",

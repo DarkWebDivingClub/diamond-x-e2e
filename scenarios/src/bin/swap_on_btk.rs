@@ -1,17 +1,23 @@
-//! An atomic cross-chain swap over Lightning.
+//! An atomic cross-chain swap with a BTK leg that is really BTK.
 //!
-//! Mission 02.4. Alice holds Knots-chain value and wants Core-chain value;
-//! Bob the reverse. Both legs use one payment hash, so neither party can
-//! take their side without enabling the other to take theirs.
+//! Mission 03.6. `lightning_swap` proved the swap across two chains, but
+//! its Knots chain ran at level 0 — `Blake2bHeight` at `INT_MAX`, 80-byte
+//! v1 headers, behaviourally Bitcoin Core. Both legs were the same kind of
+//! chain wearing different labels.
 //!
-//! Bob generates the secret. He is therefore the only party who can move
-//! first, and doing so publishes the preimage — which is what lets Alice
-//! take her side. Alice never learns the secret from the test: she reads it
-//! back from her own payment, exactly as she would in production.
+//! Here the Knots chain has activated BLAKE2b before either channel is
+//! funded, so the BTK leg lives entirely under 164-byte v2 headers while
+//! the BTC leg stays on v1. The two sides genuinely differ, and the
+//! scenario asserts that before asserting anything about the swap —
+//! otherwise it could pass by being `lightning_swap` again.
 //!
-//! Happy path only. Neither party abandons, and no CLTV ordering is
-//! asserted, so this shows atomicity under cooperation rather than under
-//! attack. Timeouts are a follow-on mission.
+//! Note which binary is which. The BTK nodes are built with the `blake2b`
+//! feature; the BTC nodes are stock `dln-node`, which has never heard of a
+//! v2 header. One side of this swap does not know the other's chain
+//! changed, and does not need to.
+//!
+//! Happy path only, as in 02.4: neither party abandons and no CLTV
+//! ordering is asserted. Mission 04 is where that gets tested.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -21,9 +27,17 @@ use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use dln_e2e_test::bitcoind::BitcoindHarness;
-use dln_e2e_test::dln_node_client::{DlnNode, SignerMode};
-use dln_e2e_test::{relay, util};
+use dln_e2e_harness::bitcoind::BitcoindHarness;
+use dln_e2e_harness::dln_node_client::{DlnNode, SignerMode};
+use dln_e2e_harness::{relay, util};
+
+/// Height at which the Knots chain activates BLAKE2b. Both channels are
+/// funded well above it, so no block either leg depends on is v1.
+const ACTIVATION_HEIGHT: u64 = 115;
+
+/// Mined on the Knots chain before anything else happens — past both
+/// coinbase maturity and the activation height.
+const KNOTS_PREMINE: u64 = 130;
 
 const CHANNEL_SATS: u64 = 2_000_000;
 const PUSH_MSAT: u64 = 500_000;
@@ -61,17 +75,41 @@ async fn run_scenario() -> Result<()> {
     std::fs::create_dir_all(&output_dir)?;
     info!("Output directory: {}", output_dir.display());
 
+    // The BTK nodes must be able to read a v2 header. The BTC nodes must
+    // not need to — they are left as stock dln-node, built by the harness.
+    // Overridable so the negative control can be run: with
+    // KNOTS_FEATURES set to anything else, the BTK nodes cannot read
+    // their own chain and this scenario must fail.
+    if std::env::var("KNOTS_FEATURES").is_err() {
+        std::env::set_var("KNOTS_FEATURES", "blake2b");
+    }
     let knots_binary = util::build_knots_node()?;
+    anyhow::ensure!(
+        std::env::var("DLN_NODE_BINARY").is_err(),
+        "DLN_NODE_BINARY is set, which would put the same binary on both \
+         chains and defeat the point of this scenario"
+    );
 
-    // ── Step 1: the 02.3 topology ───────────────────────────────────────
-    info!("Step 1: Two chains, four nodes, a channel on each");
+    // ── Step 1: two chains that differ ──────────────────────────────────
+    info!("Step 1: Core at level 0, Knots activating BLAKE2b at {ACTIVATION_HEIGHT}");
     let core = BitcoindHarness::start().await;
-    let knots = BitcoindHarness::start_knots().await;
+    let knots = BitcoindHarness::start_knots_activating_at(ACTIVATION_HEIGHT).await;
     let core_miner = core.get_new_address().await;
     let knots_miner = knots.get_new_address().await;
     core.mine_blocks(110, &core_miner).await;
-    knots.mine_blocks(110, &knots_miner).await;
+    knots.mine_blocks(KNOTS_PREMINE, &knots_miner).await;
 
+    // ── Step 2: the chains really are different ─────────────────────────
+    // Without this the scenario could pass at level 0 and prove nothing.
+    info!("Step 2: Verifying the two chains use different header formats");
+    assert_header(&core, 110, 1).await.context("the BTC chain should be v1")?;
+    assert_header(&knots, ACTIVATION_HEIGHT - 1, 1).await?;
+    assert_header(&knots, ACTIVATION_HEIGHT, 2).await?;
+    assert_header(&knots, KNOTS_PREMINE, 2).await?;
+    info!("  BTC chain v1 at 110; BTK chain v1 at {}, v2 at {ACTIVATION_HEIGHT} and {KNOTS_PREMINE}",
+          ACTIVATION_HEIGHT - 1);
+
+    info!("Step 3: Four nodes — BTK side reads v2 headers, BTC side is stock");
     let (_relay_container, relay_url) = relay::start_relay().await;
 
     let alice_core = DlnNode::start_on(
@@ -112,8 +150,30 @@ async fn run_scenario() -> Result<()> {
     .await?;
     info!("  both channels ready");
 
-    // ── Step 2: one hash, two invoices ──────────────────────────────────
-    info!("Step 2: bob generates the secret; both legs use its hash");
+    // ── Step 4: the BTK channel is funded under v2 headers ──────────────
+    // A channel that opened before activation would be 03.4's case. This
+    // one has to have started life on the BLAKE2b chain.
+    info!("Step 4: Checking the BTK channel's funding block");
+    let funding_txid = alice_knots
+        .list_channels()
+        .await?
+        .into_iter()
+        .find(|c| c["peer_pubkey"].as_str() == Some(bob_knots_id.as_str()))
+        .context("no BTK channel")?["funding_txid"]
+        .as_str()
+        .context("BTK channel has no funding_txid")?
+        .to_string();
+    let funding_height = tx_block_height(&knots, &funding_txid).await?;
+    anyhow::ensure!(
+        funding_height >= ACTIVATION_HEIGHT,
+        "the BTK channel was funded in block {funding_height}, below activation at \
+         {ACTIVATION_HEIGHT} — this leg did not open on a BLAKE2b chain"
+    );
+    assert_header(&knots, funding_height, 2).await?;
+    info!("  BTK funding {funding_txid} confirmed in block {funding_height}, a v2 block");
+
+    // ── Step 5: one hash, two invoices ──────────────────────────────────
+    info!("Step 5: bob generates the secret; both legs use its hash");
     let secret_bytes = Keys::generate().secret_key().to_secret_bytes();
     let secret = hex::encode(secret_bytes);
     let payment_hash = hex::encode(Sha256::digest(secret_bytes));
@@ -142,11 +202,11 @@ async fn run_scenario() -> Result<()> {
     }
     info!("  both invoices carry {payment_hash}");
 
-    // ── Steps 3-5: fund both legs, then settle in order ─────────────────
+    // ── Steps 6-8: fund both legs, then settle in order ─────────────────
     // Everything must overlap. Neither payment can complete until its payee
     // settles, and bob must not settle until alice's leg is also funded —
     // otherwise he takes his side while she has nothing held.
-    info!("Step 3: funding both legs");
+    info!("Step 6: funding both legs");
     let started = Instant::now();
 
     // Bob's Core payment cannot complete until alice settles the Core leg,
@@ -167,7 +227,7 @@ async fn run_scenario() -> Result<()> {
             "alice observed {observed}, expected {secret}"
         );
         info!(
-            "Step 5: alice observed the preimage from her own payment after {:.1}s",
+            "Step 8: alice observed the preimage from her own payment after {:.1}s",
             started.elapsed().as_secs_f32()
         );
 
@@ -187,7 +247,7 @@ async fn run_scenario() -> Result<()> {
         })
         .await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
-        info!("Step 4: bob settles the knots leg, revealing the secret");
+        info!("Step 7: bob settles the knots leg, revealing the secret");
         bob_knots.settle_hold_invoice(&secret).await
     };
 
@@ -201,8 +261,8 @@ async fn run_scenario() -> Result<()> {
         "the core leg settled with a different preimage"
     );
 
-    // ── Step 6: both parties ended up with what they wanted ─────────────
-    info!("Step 6: verifying balances on both chains");
+    // ── Step 9: both parties ended up with what they wanted ─────────────
+    info!("Step 9: verifying balances on both chains");
     wait_for(Duration::from_secs(60), "balances to settle", || async {
         Ok(alice_core.get_balance_msat().await? >= alice_before + CORE_LEG_MSAT
             && bob_knots.get_balance_msat().await? >= bob_before + KNOTS_LEG_MSAT)
@@ -215,6 +275,59 @@ async fn run_scenario() -> Result<()> {
     info!("  bob on knots:   {bob_before} -> {bob_after} msat");
 
     Ok(())
+}
+
+/// Assert a block's header format, from the raw serialization and from
+/// the field the RPC reports, so the two cross-check.
+async fn assert_header(bitcoind: &BitcoindHarness, height: u64, want: u64) -> Result<()> {
+    use serde_json::json;
+
+    let hash = bitcoind
+        .rpc("getblockhash", json!([height]))
+        .await
+        .map_err(|e| anyhow::anyhow!("getblockhash({height}) failed: {e}"))?;
+
+    // A Core node predates "headerv" entirely, which reads as v1.
+    let verbose = bitcoind
+        .rpc("getblockheader", json!([hash]))
+        .await
+        .map_err(|e| anyhow::anyhow!("getblockheader({height}) failed: {e}"))?;
+    let headerv = verbose["headerv"].as_u64().unwrap_or(1);
+    anyhow::ensure!(headerv == want, "height {height}: headerv is {headerv}, expected {want}");
+
+    let hex = bitcoind
+        .rpc("getblockheader", json!([hash, false]))
+        .await
+        .map_err(|e| anyhow::anyhow!("getblockheader({height}, false) failed: {e}"))?;
+    let raw = hex::decode(hex.as_str().context("header not a string")?)?;
+    let (want_len, want_bit31) = if want == 2 { (164, true) } else { (80, false) };
+    anyhow::ensure!(
+        raw.len() == want_len,
+        "height {height}: header is {} bytes, expected {want_len}",
+        raw.len()
+    );
+    let version = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    anyhow::ensure!(
+        (version & 0x8000_0000 != 0) == want_bit31,
+        "height {height}: nVersion is 0x{version:08x}, which disagrees with headerv {headerv}"
+    );
+    Ok(())
+}
+
+/// The height of the block a transaction was confirmed in.
+async fn tx_block_height(bitcoind: &BitcoindHarness, txid: &str) -> Result<u64> {
+    use serde_json::json;
+
+    let tx = bitcoind
+        .rpc("getrawtransaction", json!([txid, true]))
+        .await
+        .map_err(|e| anyhow::anyhow!("getrawtransaction({txid}) failed: {e}"))?;
+    let blockhash = tx["blockhash"].as_str().context("transaction is unconfirmed")?;
+    let header = bitcoind
+        .rpc("getblockheader", json!([blockhash]))
+        .await
+        .map_err(|e| anyhow::anyhow!("getblockheader failed: {e}"))?;
+    header["height"].as_u64().context("no height in the header")
 }
 
 /// Extract the payment hash from a BOLT11 invoice's tagged fields.

@@ -21,9 +21,9 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use tracing::info;
 
-use dln_e2e_test::bitcoind::BitcoindHarness;
-use dln_e2e_test::dln_node_client::{DlnNode, SignerMode};
-use dln_e2e_test::{relay, util};
+use dln_e2e_harness::bitcoind::BitcoindHarness;
+use dln_e2e_harness::dln_node_client::{DlnNode, SignerMode};
+use dln_e2e_harness::{relay, util};
 
 const CHANNEL_SATS: u64 = 2_000_000;
 const PUSH_MSAT: u64 = 500_000;
