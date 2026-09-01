@@ -287,13 +287,20 @@ async fn assert_header(bitcoind: &BitcoindHarness, height: u64, want: u64) -> Re
         .await
         .map_err(|e| anyhow::anyhow!("getblockhash({height}) failed: {e}"))?;
 
-    // A Core node predates "headerv" entirely, which reads as v1.
     let verbose = bitcoind
         .rpc("getblockheader", json!([hash]))
         .await
         .map_err(|e| anyhow::anyhow!("getblockheader({height}) failed: {e}"))?;
-    let headerv = verbose["headerv"].as_u64().unwrap_or(1);
-    anyhow::ensure!(headerv == want, "height {height}: headerv is {headerv}, expected {want}");
+    // Knots reports the format in "header_version": 2 for a v2 header and
+    // **0** for a v1 one — not 1. A node predating the field omits it, which
+    // also means v1. Callers still say 1 or 2, because "v1" reads better than
+    // "0" at the call site.
+    let reported = verbose["header_version"].as_u64().unwrap_or(0);
+    let expected = if want == 2 { 2 } else { 0 };
+    anyhow::ensure!(
+        reported == expected,
+        "height {height}: header_version is {reported}, expected {expected} (v{want})"
+    );
 
     let hex = bitcoind
         .rpc("getblockheader", json!([hash, false]))
@@ -309,7 +316,7 @@ async fn assert_header(bitcoind: &BitcoindHarness, height: u64, want: u64) -> Re
     let version = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     anyhow::ensure!(
         (version & 0x8000_0000 != 0) == want_bit31,
-        "height {height}: nVersion is 0x{version:08x}, which disagrees with headerv {headerv}"
+        "height {height}: nVersion is 0x{version:08x}, which disagrees with header_version {reported}"
     );
     Ok(())
 }

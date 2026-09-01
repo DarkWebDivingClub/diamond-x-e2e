@@ -65,6 +65,16 @@ impl BitcoindHarness {
             &[
                 &format!("-testactivationheight=blake2b@{height}"),
                 &format!("-blake2b_headline={ACTIVATION_HEADLINE}"),
+                // Scheduling an activation height makes the wallet sign with
+                // SIGHASH_UNIFIED immediately, but a block below that height
+                // may not carry such a signature — and the block assembler
+                // throws rather than leaving the transaction out, so the node
+                // cannot mine at all. See
+                // doc/knots-unified-sighash-preactivation.md in the workspace.
+                //
+                // Only needed here: at level 0 nothing is scheduled, so the
+                // wallet signs the legacy message anyway.
+                "-walletoldsigs=1",
             ],
         )
         .await
