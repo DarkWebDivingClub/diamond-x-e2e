@@ -1,0 +1,402 @@
+//! An atomic cross-chain swap on chains the test cannot mine on.
+//!
+//! Mission 10.3. `swap_on_btk` proves this swap, but against chains the
+//! harness starts, premines and mines on demand. Here both legs run on the
+//! live signets — `btc.signet.dwdc.club` and `btk.signet.dwdc.club` — which
+//! belong to nobody running this test.
+//!
+//! What that changes:
+//!
+//! - **No mining authority.** Every confirmation is waited for, at roughly
+//!   sixty seconds each. The scenario asserts it cannot mine, so it cannot
+//!   quietly regress into mining its way out of a wait.
+//! - **Persistent state.** The chains are not reset between runs, so
+//!   nothing here may assume a starting height, an empty wallet, or that it
+//!   is the only thing that has ever happened.
+//! - **Real funding.** Alice and Bob draw from the treasuries funded in
+//!   10.1 and 10.2 rather than from a coinbase the test just made.
+//!
+//! The BTK chain has BLAKE2b active from height 1, so unlike `swap_on_btk`
+//! there is no activation to arrange — every block is already v2. The
+//! header assertion stays, because a swap that passed with both legs on
+//! v1 chains would prove nothing about BTK.
+//!
+//! Happy path only, as in `swap_on_btk`. Mission 04 is where abandonment
+//! and CLTV ordering get tested.
+//!
+//! Run it deliberately, not in the suite:
+//!
+//! ```text
+//! cargo run --bin swap_on_signets
+//! ```
+//!
+//! It needs both treasuries funded and both signets reachable. See
+//! `doc/signet-treasury.md`.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use nostr_sdk::prelude::*;
+use sha2::{Digest, Sha256};
+use tracing::info;
+
+use dln_e2e_harness::bitcoind::{AttachConfig, BitcoindHarness};
+use dln_e2e_harness::dln_node_client::{DlnNode, SignerMode};
+use dln_e2e_harness::{relay, util};
+
+const CHANNEL_SATS: u64 = 2_000_000;
+const PUSH_MSAT: u64 = 500_000;
+
+/// Distinct per chain, so a balance assertion cannot pass by coincidence.
+const CORE_LEG_MSAT: u64 = 120_000;
+const KNOTS_LEG_MSAT: u64 = 250_000;
+
+/// A block is about sixty seconds on both chains. Channel opens need
+/// several, and a stalled miner must surface as a timeout naming the chain
+/// rather than as a hang.
+const CHANNEL_TIMEOUT: Duration = Duration::from_secs(1200);
+
+fn attach_cfg(port: u16, network: &str, label: &str) -> AttachConfig {
+    AttachConfig {
+        rpc_host: std::env::var("SIGNET_RPC_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+        rpc_port: port,
+        rpc_user: "treas".into(),
+        rpc_password: std::env::var(if port == 48333 {
+            "BTC_TREASURY_RPCPASS"
+        } else {
+            "BTK_TREASURY_RPCPASS"
+        })
+        .expect("treasury RPC password must be in the environment"),
+        wallet: "treasury".into(),
+        network: network.to_string(),
+        label: label.to_string(),
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    match run_scenario().await {
+        Ok(()) => {
+            println!("\n=== PASS ===");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("\n=== FAIL ===\n{e:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run_scenario() -> Result<()> {
+    let wall_clock = Instant::now();
+
+    let output_dir = PathBuf::from(
+        std::env::var("OUTPUT_DIR").unwrap_or_else(|_| util::unique_tmp_dir("swap-on-signets")),
+    );
+    let _ = std::fs::remove_dir_all(&output_dir);
+    std::fs::create_dir_all(&output_dir)?;
+    info!("Output directory: {}", output_dir.display());
+
+    if std::env::var("KNOTS_FEATURES").is_err() {
+        std::env::set_var("KNOTS_FEATURES", "blake2b");
+    }
+    let knots_binary = util::build_knots_node()?;
+    anyhow::ensure!(
+        std::env::var("DLN_NODE_BINARY").is_err(),
+        "DLN_NODE_BINARY is set, which would put the same binary on both \
+         chains and defeat the point of this scenario"
+    );
+
+    // ── Step 1: attach to two chains we do not own ──────────────────────
+    info!("Step 1: attaching to the live signets");
+    let core = BitcoindHarness::attach(attach_cfg(48333, "signet", "btc.signet")).await;
+    let knots = BitcoindHarness::attach(attach_cfg(48332, "signet", "btk.signet")).await;
+
+    // The whole point of this scenario. If either of these could mine, it
+    // would be swap_on_btk with different hostnames.
+    anyhow::ensure!(
+        !core.can_mine() && !knots.can_mine(),
+        "this scenario must hold no mining authority on either chain"
+    );
+
+    let core_height = height(&core).await?;
+    let knots_height = height(&knots).await?;
+    info!("  BTC signet at {core_height}, BTK signet at {knots_height} — neither is ours to mine");
+
+    // Nothing below may assume a starting height; these are only reported.
+    anyhow::ensure!(
+        core_height > 0 && knots_height > 0,
+        "a chain reported height 0 — is it still syncing?"
+    );
+
+    // ── Step 2: the chains really are different ─────────────────────────
+    // BTK activated BLAKE2b at height 1, so its tip is v2 and always was.
+    info!("Step 2: verifying the two chains use different header formats");
+    assert_header(&core, core_height, 1)
+        .await
+        .context("the BTC chain should be v1")?;
+    assert_header(&knots, knots_height, 2)
+        .await
+        .context("the BTK chain should be v2")?;
+    assert_header(&knots, 1, 2)
+        .await
+        .context("BTK activates at height 1, so block 1 should already be v2")?;
+    info!("  BTC v1 at {core_height}; BTK v2 at 1 and at {knots_height}");
+
+    // ── Step 3: four nodes, funded from the treasuries ──────────────────
+    info!("Step 3: four nodes — BTK side reads v2 headers, BTC side is stock");
+    let (_relay_container, relay_url) = relay::start_relay().await;
+
+    // On a chain we cannot mine, this address is never used; the treasury
+    // pays and the scenario waits.
+    let core_addr = core.get_new_address().await;
+    let knots_addr = knots.get_new_address().await;
+
+    let alice_core = DlnNode::start_on(
+        "alice-core", SignerMode::Plain, None,
+        &core, &core_addr, &relay_url, &output_dir,
+    ).await.context("alice-core failed to start")?;
+    let bob_core = DlnNode::start_on(
+        "bob-core", SignerMode::Plain, None,
+        &core, &core_addr, &relay_url, &output_dir,
+    ).await.context("bob-core failed to start")?;
+    let alice_knots = DlnNode::start_on(
+        "alice-knots", SignerMode::Plain, Some(&knots_binary),
+        &knots, &knots_addr, &relay_url, &output_dir,
+    ).await.context("alice-knots failed to start")?;
+    let bob_knots = DlnNode::start_on(
+        "bob-knots", SignerMode::Plain, Some(&knots_binary),
+        &knots, &knots_addr, &relay_url, &output_dir,
+    ).await.context("bob-knots failed to start")?;
+    info!("  four nodes funded from the treasuries after {:.0}s", wall_clock.elapsed().as_secs_f32());
+
+    // ── Step 4: channels, confirmed by the chains' own miners ───────────
+    let alice_core_id = alice_core.node_id();
+    let bob_knots_id = bob_knots.node_id();
+    bob_core
+        .open_channel(&alice_core_id, &format!("127.0.0.1:{}", alice_core.ln_port),
+                      CHANNEL_SATS, Some(PUSH_MSAT))
+        .await.context("core channel open failed")?;
+    alice_knots
+        .open_channel(&bob_knots_id, &format!("127.0.0.1:{}", bob_knots.ln_port),
+                      CHANNEL_SATS, Some(PUSH_MSAT))
+        .await.context("knots channel open failed")?;
+
+    info!("Step 4: waiting for both channels — real blocks, about a minute each");
+    let opened = Instant::now();
+    wait_for(CHANNEL_TIMEOUT, "both channels ready", || async {
+        Ok(bob_core.has_ready_channel_with(&alice_core_id).await
+            && alice_knots.has_ready_channel_with(&bob_knots_id).await)
+    })
+    .await
+    .context("channels never confirmed — are both miners producing?")?;
+    info!("  both channels ready after {:.0}s of waiting", opened.elapsed().as_secs_f32());
+
+    // ── Step 5: the BTK channel really is on the BLAKE2b chain ──────────
+    let funding_txid = alice_knots
+        .list_channels()
+        .await?
+        .into_iter()
+        .find(|c| c["peer_pubkey"].as_str() == Some(bob_knots_id.as_str()))
+        .context("no BTK channel")?["funding_txid"]
+        .as_str()
+        .context("BTK channel has no funding_txid")?
+        .to_string();
+    let funding_height = tx_block_height(&knots, &funding_txid).await?;
+    assert_header(&knots, funding_height, 2).await?;
+    info!("Step 5: BTK funding {funding_txid} confirmed in block {funding_height}, a v2 block");
+
+    // ── Step 6: one hash, two invoices ──────────────────────────────────
+    info!("Step 6: bob generates the secret; both legs use its hash");
+    let secret_bytes = Keys::generate().secret_key().to_secret_bytes();
+    let secret = hex::encode(secret_bytes);
+    let payment_hash = hex::encode(Sha256::digest(secret_bytes));
+
+    let alice_before = alice_core.get_balance_msat().await?;
+    let bob_before = bob_knots.get_balance_msat().await?;
+
+    let alice_invoice = alice_core
+        .make_hold_invoice(CORE_LEG_MSAT, &payment_hash, "swap: alice receives btc")
+        .await
+        .context("alice-core make_hold_invoice failed")?;
+    let bob_invoice = bob_knots
+        .make_hold_invoice(KNOTS_LEG_MSAT, &payment_hash, "swap: bob receives btk")
+        .await
+        .context("bob-knots make_hold_invoice failed")?;
+
+    anyhow::ensure!(alice_invoice != bob_invoice, "both legs produced the same invoice");
+    for (who, inv) in [("alice", &alice_invoice), ("bob", &bob_invoice)] {
+        anyhow::ensure!(
+            invoice_payment_hash(inv)? == payment_hash,
+            "{who}'s invoice does not carry the agreed payment hash"
+        );
+    }
+    info!("  both invoices carry {payment_hash}");
+
+    // ── Steps 7-9: fund both legs, then settle in order ─────────────────
+    // Lightning settles off-chain, so this part costs no blocks and runs at
+    // the same speed it does on regtest. Only the setup was slow.
+    info!("Step 7: funding both legs");
+    let started = Instant::now();
+
+    let bob_pays_core = bob_core.pay_invoice(&alice_invoice);
+
+    let alice_flow = async {
+        let observed = alice_knots
+            .pay_invoice(&bob_invoice)
+            .await
+            .context("alice-knots pay_invoice failed")?;
+        anyhow::ensure!(observed == secret, "alice observed {observed}, expected {secret}");
+        info!(
+            "Step 9: alice observed the preimage from her own payment after {:.1}s",
+            started.elapsed().as_secs_f32()
+        );
+        alice_core
+            .settle_hold_invoice(&observed)
+            .await
+            .context("alice-core settle_hold_invoice failed")?;
+        Ok::<String, anyhow::Error>(observed)
+    };
+
+    let bob_settles = async {
+        wait_for(Duration::from_secs(180), "both legs held", || async {
+            Ok(alice_core.lookup_invoice(&payment_hash).await.is_ok()
+                && bob_knots.lookup_invoice(&payment_hash).await.is_ok())
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        info!("Step 8: bob settles the BTK leg, revealing the secret");
+        bob_knots.settle_hold_invoice(&secret).await
+    };
+
+    let (core_payment, alice_result, settled) =
+        tokio::join!(bob_pays_core, alice_flow, bob_settles);
+    settled.context("bob-knots settle_hold_invoice failed")?;
+    let observed = alice_result?;
+    let core_preimage = core_payment.context("bob-core pay_invoice failed")?;
+    anyhow::ensure!(
+        core_preimage == observed,
+        "the BTC leg settled with a different preimage"
+    );
+
+    // ── Step 10: both parties ended up with what they wanted ────────────
+    info!("Step 10: verifying balances on both chains");
+    wait_for(Duration::from_secs(120), "balances to settle", || async {
+        Ok(alice_core.get_balance_msat().await? >= alice_before + CORE_LEG_MSAT
+            && bob_knots.get_balance_msat().await? >= bob_before + KNOTS_LEG_MSAT)
+    })
+    .await?;
+
+    let alice_after = alice_core.get_balance_msat().await?;
+    let bob_after = bob_knots.get_balance_msat().await?;
+    info!("  alice on BTC:  {alice_before} -> {alice_after} msat");
+    info!("  bob on BTK:    {bob_before} -> {bob_after} msat");
+    info!(
+        "  total wall-clock {:.0}s, of which {:.0}s was waiting for channels",
+        wall_clock.elapsed().as_secs_f32(),
+        opened.elapsed().as_secs_f32()
+    );
+
+    Ok(())
+}
+
+async fn height(bitcoind: &BitcoindHarness) -> Result<u64> {
+    bitcoind
+        .rpc("getblockcount", serde_json::json!([]))
+        .await
+        .map_err(|e| anyhow::anyhow!("getblockcount failed: {e}"))?
+        .as_u64()
+        .context("getblockcount did not return a number")
+}
+/// Assert a block's header format, from the raw serialization and from
+/// the field the RPC reports, so the two cross-check.
+async fn assert_header(bitcoind: &BitcoindHarness, height: u64, want: u64) -> Result<()> {
+    use serde_json::json;
+
+    let hash = bitcoind
+        .rpc("getblockhash", json!([height]))
+        .await
+        .map_err(|e| anyhow::anyhow!("getblockhash({height}) failed: {e}"))?;
+
+    let verbose = bitcoind
+        .rpc("getblockheader", json!([hash]))
+        .await
+        .map_err(|e| anyhow::anyhow!("getblockheader({height}) failed: {e}"))?;
+    // Knots reports the format in "header_version": 2 for a v2 header and
+    // **0** for a v1 one — not 1. A node predating the field omits it, which
+    // also means v1. Callers still say 1 or 2, because "v1" reads better than
+    // "0" at the call site.
+    let reported = verbose["header_version"].as_u64().unwrap_or(0);
+    let expected = if want == 2 { 2 } else { 0 };
+    anyhow::ensure!(
+        reported == expected,
+        "height {height}: header_version is {reported}, expected {expected} (v{want})"
+    );
+
+    let hex = bitcoind
+        .rpc("getblockheader", json!([hash, false]))
+        .await
+        .map_err(|e| anyhow::anyhow!("getblockheader({height}, false) failed: {e}"))?;
+    let raw = hex::decode(hex.as_str().context("header not a string")?)?;
+    let (want_len, want_bit31) = if want == 2 { (164, true) } else { (80, false) };
+    anyhow::ensure!(
+        raw.len() == want_len,
+        "height {height}: header is {} bytes, expected {want_len}",
+        raw.len()
+    );
+    let version = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    anyhow::ensure!(
+        (version & 0x8000_0000 != 0) == want_bit31,
+        "height {height}: nVersion is 0x{version:08x}, which disagrees with header_version {reported}"
+    );
+    Ok(())
+}
+
+/// The height of the block a transaction was confirmed in.
+async fn tx_block_height(bitcoind: &BitcoindHarness, txid: &str) -> Result<u64> {
+    use serde_json::json;
+
+    let tx = bitcoind
+        .rpc("getrawtransaction", json!([txid, true]))
+        .await
+        .map_err(|e| anyhow::anyhow!("getrawtransaction({txid}) failed: {e}"))?;
+    let blockhash = tx["blockhash"].as_str().context("transaction is unconfirmed")?;
+    let header = bitcoind
+        .rpc("getblockheader", json!([blockhash]))
+        .await
+        .map_err(|e| anyhow::anyhow!("getblockheader failed: {e}"))?;
+    header["height"].as_u64().context("no height in the header")
+}
+
+/// Extract the payment hash from a BOLT11 invoice's tagged fields.
+fn invoice_payment_hash(invoice: &str) -> Result<String> {
+    use lightning_invoice::Bolt11Invoice;
+    use std::str::FromStr;
+    let parsed = Bolt11Invoice::from_str(invoice)
+        .map_err(|e| anyhow::anyhow!("invoice did not parse: {e:?}"))?;
+    Ok(parsed.payment_hash().to_string())
+}
+
+
+async fn wait_for<F, Fut>(timeout: Duration, what: &str, mut check: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if check().await? {
+            return Ok(());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}

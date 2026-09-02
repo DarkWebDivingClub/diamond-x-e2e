@@ -12,10 +12,38 @@ const RPC_PASS: &str = "rpcpass";
 const RPC_PORT: u16 = 18443;
 
 pub struct BitcoindHarness {
-    _container: ContainerAsync<GenericImage>,
+    /// `None` when attached to a node we did not start — see `attach`.
+    /// Dropping the harness must not stop somebody else's node.
+    _container: Option<ContainerAsync<GenericImage>>,
     rpc_url: String,
     rpc_port: u16,
+    rpc_user: String,
+    rpc_password: String,
+    wallet: String,
+    network: String,
+    /// Human name for messages. Both signets report network "signet", so
+    /// without this a timeout cannot say which chain stalled.
+    label: String,
     client: reqwest::Client,
+}
+
+/// How to reach a node this harness did not start.
+///
+/// A scenario running against a shared chain has no mining authority and
+/// cannot choose the chain's parameters, so everything here is discovered
+/// rather than decided.
+#[derive(Clone, Debug)]
+pub struct AttachConfig {
+    pub rpc_host: String,
+    pub rpc_port: u16,
+    pub rpc_user: String,
+    pub rpc_password: String,
+    pub wallet: String,
+    /// `signet`, `regtest`, ... — passed through to dln-node.
+    pub network: String,
+    /// What to call this chain in errors, e.g. `btk.signet`. Both signets
+    /// share a network name, so this is what makes a timeout actionable.
+    pub label: String,
 }
 
 /// Bitcoin Core regtest image.
@@ -131,9 +159,14 @@ impl BitcoindHarness {
             .expect("Failed to build HTTP client");
 
         let harness = Self {
-            _container: container,
+            _container: Some(container),
             rpc_url,
             rpc_port: host_port,
+            rpc_user: RPC_USER.to_string(),
+            rpc_password: RPC_PASS.to_string(),
+            wallet: "testwallet".to_string(),
+            network: "regtest".to_string(),
+            label: format!("{image}:{tag}"),
             client,
         };
 
@@ -141,6 +174,92 @@ impl BitcoindHarness {
         harness.create_wallet("testwallet").await;
 
         harness
+    }
+
+    /// Attach to a node that is already running and that we do not own.
+    ///
+    /// The chain is shared, so this harness cannot mine on it: use
+    /// `wait_for_confirmations` instead of `mine_blocks`. Dropping it leaves
+    /// the node running.
+    pub async fn attach(cfg: AttachConfig) -> Self {
+        let rpc_url = format!("http://{}:{}", cfg.rpc_host, cfg.rpc_port);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("Failed to build HTTP client");
+
+        let harness = Self {
+            _container: None,
+            rpc_url,
+            rpc_port: cfg.rpc_port,
+            rpc_user: cfg.rpc_user,
+            rpc_password: cfg.rpc_password,
+            wallet: cfg.wallet,
+            network: cfg.network,
+            label: cfg.label,
+            client,
+        };
+
+        harness.wait_until_ready().await;
+        harness
+    }
+
+    /// The chain's network name, for anything that has to be told which
+    /// chain it is on.
+    pub fn network(&self) -> &str {
+        &self.network
+    }
+
+    /// False when attached to a chain we do not control. A scenario that
+    /// mines unconditionally is a scenario that cannot run against a real
+    /// chain, so this is worth asserting rather than discovering.
+    pub fn can_mine(&self) -> bool {
+        self._container.is_some()
+    }
+
+    /// Wait for `txid` to reach `want` confirmations.
+    ///
+    /// This is what replaces `mine_blocks` on a chain we do not control.
+    /// It must fail loudly: a scenario that carries on with an unconfirmed
+    /// channel proves nothing, so the timeout is an error rather than a
+    /// shrug.
+    pub async fn wait_for_confirmations(
+        &self,
+        txid: &str,
+        want: u64,
+        timeout: Duration,
+    ) -> Result<u64, String> {
+        let started = std::time::Instant::now();
+        let mut last_seen: i64 = -1;
+
+        while started.elapsed() < timeout {
+            match self
+                .rpc_call("gettransaction", json!([txid]))
+                .await
+                .ok()
+                .and_then(|v| v.get("confirmations").and_then(|c| c.as_i64()))
+            {
+                Some(c) if c >= want as i64 => return Ok(c as u64),
+                Some(c) => {
+                    if c != last_seen {
+                        tracing::info!(
+                            "  {} on {}: {c}/{want} confirmations",
+                            &txid[..12.min(txid.len())],
+                            self.label
+                        );
+                        last_seen = c;
+                    }
+                }
+                None => {}
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+
+        Err(format!(
+            "{txid} did not reach {want} confirmations on {} within {:?} \
+             (last seen {last_seen}) — is {} producing blocks?",
+            self.label, timeout, self.label
+        ))
     }
 
     pub async fn create_wallet(&self, wallet: &str) {
@@ -183,19 +302,19 @@ impl BitcoindHarness {
         self.rpc_port
     }
 
-    pub fn rpc_user(&self) -> &'static str {
-        RPC_USER
+    pub fn rpc_user(&self) -> &str {
+        &self.rpc_user
     }
 
-    pub fn rpc_password(&self) -> &'static str {
-        RPC_PASS
+    pub fn rpc_password(&self) -> &str {
+        &self.rpc_password
     }
 
     /// Full RPC URL including the http:// scheme.
     pub fn rpc_url_with_auth(&self) -> String {
         format!(
-            "http://{}:{}@127.0.0.1:{}/wallet/testwallet",
-            RPC_USER, RPC_PASS, self.rpc_port
+            "http://{}:{}@127.0.0.1:{}/wallet/{}",
+            self.rpc_user, self.rpc_password, self.rpc_port, self.wallet
         )
     }
 
@@ -208,7 +327,11 @@ impl BitcoindHarness {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
-        panic!("bitcoind RPC did not become ready in time");
+        panic!(
+            "{} RPC at {} did not become ready in time — is the node running, \
+             and are the credentials right?",
+            self.label, self.rpc_url
+        );
     }
 
     /// Issue an arbitrary JSON-RPC call, for assertions the typed helpers
@@ -228,7 +351,7 @@ impl BitcoindHarness {
         let response = self
             .client
             .post(&self.rpc_url)
-            .basic_auth(RPC_USER, Some(RPC_PASS))
+            .basic_auth(&self.rpc_user, Some(&self.rpc_password))
             .json(&body)
             .send()
             .await

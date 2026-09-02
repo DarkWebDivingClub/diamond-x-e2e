@@ -225,7 +225,7 @@ impl DlnNode {
                 "--relay", relay_url,
                 "--proxy-pubkey", &np_pubkey_hex,
                 "--nsec", &signer_nsec_hex,
-                "--network", "regtest",
+                "--network", bitcoind.network(),
                 "--integration-test",
                 "--protocol-version", "6",
                 "--policy-filter", "policy-commitment-htlc-routing-balance:warn",
@@ -257,7 +257,7 @@ impl DlnNode {
 
         let config = LdkConfig {
             node: LdkNodeConfig {
-                network: "regtest".to_string(),
+                network: bitcoind.network().to_string(),
                 listening_port: ln_port,
                 data_dir: data_dir.to_string_lossy().to_string(),
             },
@@ -381,10 +381,24 @@ impl DlnNode {
             .context("make_new_address response parse failed")?
             .address;
 
-        bitcoind.send_to_address(&addr, 0.05).await;
-        bitcoind.mine_blocks(1, miner_address).await;
+        let funding_txid = bitcoind.send_to_address(&addr, 0.05).await;
+        if bitcoind.can_mine() {
+            bitcoind.mine_blocks(1, miner_address).await;
+        } else {
+            // A shared chain confirms on its own schedule. Waiting is the
+            // only option, and it has to be a hard wait: carrying on with an
+            // unfunded wallet would fail later and further from the cause.
+            tracing::info!("{name}: no mining authority, waiting for funding to confirm");
+            bitcoind
+                .wait_for_confirmations(&funding_txid, 1, Duration::from_secs(600))
+                .await
+                .map_err(|e| anyhow::anyhow!("{name} funding never confirmed: {e}"))?;
+        }
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        // A chain we do not control needs a deadline measured in blocks, not
+        // in the seconds a regtest chain takes to mine on demand.
+        let balance_timeout = if bitcoind.can_mine() { 30 } else { 600 };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(balance_timeout);
         loop {
             match Self::send_nwc_request_static(
                 &nwc_client,
