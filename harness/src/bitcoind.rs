@@ -340,7 +340,33 @@ impl BitcoindHarness {
         self.rpc_call(method, params).await
     }
 
+    /// Issue a JSON-RPC call against a named wallet rather than the node's
+    /// default one.
+    ///
+    /// A node can hold several wallets, and a scenario that funds one from
+    /// another needs to say which it means — `rpc` alone talks to the node,
+    /// not to a wallet.
+    pub async fn rpc_wallet(
+        &self,
+        wallet: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        let url = format!("{}/wallet/{}", self.rpc_url, wallet);
+        self.rpc_call_at(&url, method, params).await
+    }
+
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let url = self.rpc_url.clone();
+        self.rpc_call_at(&url, method, params).await
+    }
+
+    async fn rpc_call_at(
+        &self,
+        url: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
         let body = json!({
             "jsonrpc": "1.0",
             "id": "test",
@@ -350,7 +376,7 @@ impl BitcoindHarness {
 
         let response = self
             .client
-            .post(&self.rpc_url)
+            .post(url)
             .basic_auth(&self.rpc_user, Some(&self.rpc_password))
             .json(&body)
             .send()
