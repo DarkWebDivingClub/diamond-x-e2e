@@ -596,7 +596,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "diamond-x-e2e"
+name = "diamond-x-e2e-test"
 version = "0.1.0"
 dependencies = [
  "anyhow",
